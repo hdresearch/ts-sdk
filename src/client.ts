@@ -3,7 +3,7 @@
 
 import type { RegistryKernelInfo, ListRegistryBaseImagesResponse, VmAllocation, CreateRepositoryResponse, VmStatsResponse, CreateProjectRequest, RestoreProjectRequest, RegistryBaseImageInfo, WakeComputerResponse, OciImportSourceRequest, VmExecResponse, CreateCheckpointTagRequest, RestoreComputerFromCheckpointRequest, ListCheckpointTagsResponse, VmExecRequest, AssignCheckpointProjectsRequest, ValidateKeyResponse, VmTerminalSessionEvent, VmCpuStats, OperationKind, AssertedOciImageSourceIdentityRequest, CheckpointTag, SetEnvVarsRequest, VmReadFileResponse, OperationResourceKind, VolumeBackend, VmMemoryStats, AssignComputerProjectRequest, AllocationTotals, OperationStatus, ProjectDeletionKeptReason, FindTenantOciImageBySourceResponse, ListCheckpointsResponse, ProjectDeletionResult, CreateComputerSource, CreateRepositoryRequest, DomainResponse, ProjectMetadata, CreateV2OciUploadResponse, VmTerminalSessionStartRequest, OperationResource, VmTerminalSessionAttachRequest, VmLoadAvg, BranchComputersRequest, OperationEvent, VmExecStreamInfrastructureError, VmExecLogEntry, SetRepositoryVisibilityRequest, UpdateRepoTagRequest, VmCreateVmConfig, CurrentUsageResponse, MoveProjectRequest, CheckpointKind, CreateComputerCheckpointRequest, UpdateCheckpointRequest, UpdateCheckpointTagRequest, ListComputersResponse, UpdateComputerStateRequest, AssertedOciImageSourceIdentityKind, CreateComputerRequest, RepoTagInfo, ComputerLabelsRequest, EnvVarsResponse, PublicRepositoryInfo, WhoamiOrg, CreateRepoTagRequest, BranchComputersResponse, WhoamiApiKey, VmCpuTimes, ProjectDeletionPlan, VmWorkloadLogTerminal, RestoreProjectResponse, ListRepoTagsResponse, ComputerSshKeyResponse, VmExecStreamAttachRequest, ComputerResponse, ListPublicRepositoriesResponse, ListRepositoriesResponse, Operation, CreateRepoTagResponse, VmTerminalSessionControl, DeleteDomainResponse, RepositoryInfo, VmTerminalSize, CreateOciImageRequest, VmState, ProjectDeletionKeptCommit, VmWriteFileBody, BranchSourceRequest, ListTenantOciImagesResponse, ProjectDeletionProject, IncreaseComputerResourcesRequest, CheckpointResponse, ForkRepositoryResponse, ComputerRuntimeState, Project, ComputerKeepAliveRequest, VmAdmissionCode, CreateComputerRootRequest, VmExecStreamEvent, VmWorkloadLogStream, ListRegistryKernelsResponse, CommitAvailability, VmWorkloadLogEvent, VmWorkloadLogEndReason, ForkRepositoryRequest, ProjectNetworkService, VmWorkloadLogCaptureError, ProjectNetwork, VmExecLogStream, CheckpointLineageEntry, WhoamiResponse, BranchedComputerResponse, ApiKeyAllocations, CheckpointLineageResponse, CreateCheckpointTagResponse, TenantOciImageResponse, CreateDomainRequest, ExecuteProjectDeletionRequest, SystemImageResponse, VmResizeDiskRequest, CreateOciUploadRequest, OperationFailure, VmWriteFileJsonRequest, WhoamiUser, ListSystemImagesResponse, VmExecLogResponse, DeleteTenantOciImageResponse, VmWorkloadLogSnapshot, GetComputerLogsParams, ListDomainsParams, UpdateComputerStateParams, GetComputerWorkloadLogsParams, SleepComputerParams, ListRegistryBaseImagesParams, V2ListSystemImagesParams, DeleteComputerParams, ListComputersParams, CurrentUsageParams, FollowComputerWorkloadLogsParams, ListRegistryKernelsParams, ResizeComputerDiskParams, V2ListImagesParams, ListProjectsParams, ListPublicCheckpointsParams, ListCheckpointsParams, V2FindImageBySourceParams, ReadComputerFileParams, WriteComputerFileParams, OperationEventsParams,  } from "./models";
 import type { RequestOptions } from "./request-options";
-import { APIError, APIConnectionError } from "./errors";
+import { APIError, APIConnectionError, APIConnectionTimeoutError } from "./errors";
 import { getEnv, detectRuntime, getDefaultFetch } from "./shims";
 
 export interface Logger {
@@ -47,10 +47,31 @@ export interface VersSdkClientOptions {
 }
 
 // Status codes that are retryable even though they are 4xx
-const RETRYABLE_STATUS_CODES = new Set([408, 409, 429]);
+const RETRYABLE_STATUS_CODES = new Set([408, 429]);
 
 function isRetryableStatus(status: number): boolean {
   return status >= 500 || RETRYABLE_STATUS_CODES.has(status);
+}
+
+function isBinaryBody(body: unknown): body is Uint8Array | ArrayBuffer | ArrayBufferView {
+  return body instanceof Uint8Array || body instanceof ArrayBuffer || ArrayBuffer.isView(body);
+}
+
+function hasHeader(headers: Record<string, string | null | undefined> | undefined, name: string): boolean {
+  if (!headers) return false;
+  const lower = name.toLowerCase();
+  return Object.keys(headers).some((k) => k.toLowerCase() === lower);
+}
+
+function isRequestOptions(value: unknown): value is RequestOptions {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return (
+    "headers" in v ||
+    "timeout" in v ||
+    "signal" in v ||
+    "fetchOptions" in v
+  );
 }
 
 function retryDelay(retryCount: number): number {
@@ -80,24 +101,30 @@ export class VersSdkClient {
   private maxRetries: number;
   private timeout: number;
   private logLevel: LogLevel;
-  private fetchFn: typeof fetch;
+  private fetchFn?: typeof fetch;
   private fetchOptions: RequestInit;
   private logger: Logger;
 
   // Resource accessors
 
   constructor(options: VersSdkClientOptions = {}) {
-    this.baseUrl = options.baseUrl ?? getEnv("VERS_BASE_URL") ?? "https://api.vers.sh";
+    this.baseUrl = (options.baseUrl ?? getEnv("VERS_BASE_URL") ?? "https://api.vers.sh").replace(/\/+$/, "");
     this.apiKey = options.apiKey ?? getEnv("VERS_API_KEY");
     this.headers = options.headers ?? {};
     this.maxRetries = options.maxRetries ?? 2;
     this.timeout = options.timeout ?? 30000;
     this.logLevel = options.logLevel ?? parseLogLevel(getEnv("VERS_LOG")) ?? 'warn';
-    this.fetchFn = options.fetch ?? globalThis.fetch;
+    this.fetchFn = options.fetch;
     this.fetchOptions = options.fetchOptions ?? {};
     this.logger = options.logger ?? console;
 
     // Initialize resources
+  }
+
+  private async parseJsonResponse<T>(resp: Response): Promise<T> {
+    const text = await resp.text();
+    if (!text) return undefined as unknown as T;
+    return JSON.parse(text) as T;
   }
 
   /**
@@ -105,35 +132,35 @@ export class VersSdkClient {
    * retries, and error handling as generated methods.
    */
   get<T = unknown>(path: string, options?: RequestOptions): Promise<T> {
-    return this.request("GET", path, undefined, options).then(r => r.json() as Promise<T>);
+    return this.request("GET", path, undefined, options).then((r) => this.parseJsonResponse<T>(r));
   }
 
   /**
    * Make a POST request to an arbitrary path.
    */
   post<T = unknown>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    return this.request("POST", path, body, options).then(r => r.json() as Promise<T>);
+    return this.request("POST", path, body, options).then((r) => this.parseJsonResponse<T>(r));
   }
 
   /**
    * Make a PUT request to an arbitrary path.
    */
   put<T = unknown>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    return this.request("PUT", path, body, options).then(r => r.json() as Promise<T>);
+    return this.request("PUT", path, body, options).then((r) => this.parseJsonResponse<T>(r));
   }
 
   /**
    * Make a PATCH request to an arbitrary path.
    */
   patch<T = unknown>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
-    return this.request("PATCH", path, body, options).then(r => r.json() as Promise<T>);
+    return this.request("PATCH", path, body, options).then((r) => this.parseJsonResponse<T>(r));
   }
 
   /**
    * Make a DELETE request to an arbitrary path.
    */
   del<T = unknown>(path: string, options?: RequestOptions): Promise<T> {
-    return this.request("DELETE", path, undefined, options).then(r => r.json() as Promise<T>);
+    return this.request("DELETE", path, undefined, options).then((r) => this.parseJsonResponse<T>(r));
   }
 
   private log(level: LogLevel, message: string): void {
@@ -149,12 +176,11 @@ export class VersSdkClient {
     for (const source of sources) {
       if (!source) continue;
       for (const [key, value] of Object.entries(source)) {
-        if (value === null || value === undefined) {
-          // Remove header (case-insensitive)
-          for (const k of Object.keys(merged)) {
-            if (k.toLowerCase() === key.toLowerCase()) delete merged[k];
-          }
-        } else {
+        const lower = key.toLowerCase();
+        for (const existingKey of Object.keys(merged)) {
+          if (existingKey.toLowerCase() === lower) delete merged[existingKey];
+        }
+        if (value !== null && value !== undefined) {
           merged[key] = value;
         }
       }
@@ -191,75 +217,96 @@ export class VersSdkClient {
   }
 
   private async request(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<Response> {
+    const upperMethod = method.toUpperCase();
+    const binary = isBinaryBody(body);
+
     const defaultHeaders: Record<string, string> = {
-      "Content-Type": "application/json",
       "User-Agent": this.userAgent,
     };
+    if (body !== undefined) {
+      defaultHeaders["Content-Type"] = binary ? "application/octet-stream" : "application/json";
+    }
     if (this.apiKey) {
       defaultHeaders["Authorization"] = `Bearer ${this.apiKey}`;
     }
+
+    // Generate Idempotency-Key once per mutating (POST, DELETE) call if not
+    // explicitly provided or suppressed, and reuse the exact same key across retries.
+    const needsIdempotencyKey = upperMethod === "POST" || upperMethod === "DELETE";
+    const idempotencyExplicitlyHandled =
+      hasHeader(this.headers, "Idempotency-Key") || hasHeader(options?.headers, "Idempotency-Key");
+    if (needsIdempotencyKey && !idempotencyExplicitlyHandled) {
+      defaultHeaders["Idempotency-Key"] = globalThis.crypto.randomUUID();
+    }
+
     const headers = this.mergeHeaders(defaultHeaders, this.headers, options?.headers);
 
-    const mutating = ["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase());
-    if (mutating) {
-      headers["X-Idempotency-Key"] = crypto.randomUUID();
-    }
-    // Merge per-request headers; null values remove the header
-    if (options?.headers) {
-      for (const [key, value] of Object.entries(options.headers)) {
-        if (value === null) {
-          delete headers[key];
-        } else {
-          headers[key] = value;
-        }
-      }
+    let serializedBody: BodyInit | undefined;
+    if (body === undefined) {
+      serializedBody = undefined;
+    } else if (body instanceof ArrayBuffer) {
+      serializedBody = body;
+    } else if (ArrayBuffer.isView(body)) {
+      const copy = new Uint8Array(body.byteLength);
+      copy.set(new Uint8Array(body.buffer, body.byteOffset, body.byteLength));
+      serializedBody = copy;
+    } else {
+      serializedBody = JSON.stringify(body);
     }
 
     const effectiveTimeout = options?.timeout ?? this.timeout;
+    const fetchImpl = this.fetchFn ?? getDefaultFetch();
 
-    this.log('debug', `request: ${method} ${path}`);
+    this.log('debug', `request: ${upperMethod} ${path}`);
     let lastError: unknown;
     let lastRetryAfterUsed = false;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       if (attempt > 0 && !lastRetryAfterUsed) {
-        this.log('info', `retry attempt ${attempt}/${this.maxRetries} for ${method} ${path}`);
+        this.log('info', `retry attempt ${attempt}/${this.maxRetries} for ${upperMethod} ${path}`);
         await new Promise((resolve) => setTimeout(resolve, retryDelay(attempt - 1)));
       }
       lastRetryAfterUsed = false;
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
-      // If caller provided an AbortSignal, forward its abort to our controller
-      if (options?.signal) {
-        if (options.signal.aborted) {
+      let timedOut = false;
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, effectiveTimeout);
+
+      const externalSignal = options?.signal;
+      const onExternalAbort = () => controller.abort();
+      if (externalSignal) {
+        if (externalSignal.aborted) {
           controller.abort();
         } else {
-          options.signal.addEventListener("abort", () => controller.abort(), { once: true });
+          externalSignal.addEventListener("abort", onExternalAbort, { once: true });
         }
       }
 
       try {
         const mergedFetchOptions = { ...this.fetchOptions, ...options?.fetchOptions };
-        const response = await this.fetchFn(`${this.baseUrl}${path}`, {
+        const response = await fetchImpl(`${this.baseUrl}${path}`, {
           ...mergedFetchOptions,
-          method,
+          method: upperMethod,
           headers,
-          body: body ? JSON.stringify(body) : undefined,
+          body: serializedBody,
           signal: controller.signal,
         });
 
         if (isRetryableStatus(response.status) && attempt < this.maxRetries) {
           const retryAfterDelay = parseRetryAfter(response.headers.get('retry-after'));
+          await response.body?.cancel().catch(() => {});
           if (retryAfterDelay != null) {
             lastRetryAfterUsed = true;
-            this.log('info', `retry attempt ${attempt + 1}/${this.maxRetries} for ${method} ${path} (retry-after: ${retryAfterDelay}ms)`);
+            this.log('info', `retry attempt ${attempt + 1}/${this.maxRetries} for ${upperMethod} ${path} (retry-after: ${retryAfterDelay}ms)`);
             await new Promise((resolve) => setTimeout(resolve, retryAfterDelay));
           }
           lastError = new Error(`HTTP ${response.status}`);
           continue;
         }
 
-        this.log('debug', `response: ${response.status} for ${method} ${path}`);
+        this.log('debug', `response: ${response.status} for ${upperMethod} ${path}`);
 
         if (!response.ok) {
           let errorBody: object | undefined;
@@ -274,20 +321,32 @@ export class VersSdkClient {
             }
           } catch {}
           const err = APIError.generate(response.status, errorBody, errorMessage, response.headers);
-          this.log('error', `API error: ${response.status} ${method} ${path}`);
+          this.log('error', `API error: ${response.status} ${upperMethod} ${path}`);
           throw err;
         }
 
         return response;
       } catch (error) {
         if (error instanceof APIError) throw error;
+        if (externalSignal?.aborted) {
+          throw new APIConnectionError({
+            message: "Request aborted.",
+            cause: error instanceof Error ? error : undefined,
+          });
+        }
         lastError = error;
-        this.log('error', `connection error: ${method} ${path} - ${error instanceof Error ? error.message : String(error)}`);
+        this.log('error', `connection error: ${upperMethod} ${path} - ${error instanceof Error ? error.message : String(error)}`);
         if (attempt === this.maxRetries) {
+          if (timedOut) {
+            throw new APIConnectionTimeoutError();
+          }
           throw new APIConnectionError({ cause: error instanceof Error ? error : undefined });
         }
       } finally {
         clearTimeout(timeoutId);
+        if (externalSignal) {
+          externalSignal.removeEventListener("abort", onExternalAbort);
+        }
       }
     }
 
@@ -310,8 +369,8 @@ export class VersSdkClient {
   /**
    * Start one durable whole-computer checkpoint. The operation becomes terminal only when the checkpoint is portable across Chelsea nodes.
    */
-  async checkpointComputer(computer_id: string, body: CreateComputerCheckpointRequest, options?: RequestOptions): Promise<Operation> {
-    let url = `/api/v2/computers/${computer_id}/checkpoints`;
+  async checkpointComputer(computer_id: string, body: CreateComputerCheckpointRequest = {}, options?: RequestOptions): Promise<Operation> {
+    let url = `/api/v2/computers/${encodeURIComponent(computer_id)}/checkpoints`;
     const resp = await this.request("POST", url, body, options);
     const text = await resp.text();
     if (!text) return {} as unknown as Operation;
@@ -361,9 +420,17 @@ export class VersSdkClient {
   /**
    * Wake a sleeping computer, preserving its identity and execution state.
    */
-  async wakeComputer(computer_id: string, body: Record<string, unknown>, options?: RequestOptions): Promise<WakeComputerResponse> {
-    let url = `/api/v2/computers/${computer_id}/wake`;
-    const resp = await this.request("POST", url, body, options);
+  async wakeComputer(computer_id: string, options?: RequestOptions): Promise<WakeComputerResponse>;
+  /** @deprecated The wake endpoint does not take a request body. Pass RequestOptions as the second argument. */
+  async wakeComputer(computer_id: string, body?: Record<string, unknown>, options?: RequestOptions): Promise<WakeComputerResponse>;
+  async wakeComputer(
+    computer_id: string,
+    bodyOrOptions?: Record<string, unknown> | RequestOptions,
+    options?: RequestOptions,
+  ): Promise<WakeComputerResponse> {
+    const reqOptions = options ?? (isRequestOptions(bodyOrOptions) ? bodyOrOptions : undefined);
+    const url = `/api/v2/computers/${encodeURIComponent(computer_id)}/wake`;
+    const resp = await this.request("POST", url, undefined, reqOptions);
     const text = await resp.text();
     if (!text) return {} as unknown as WakeComputerResponse;
     return JSON.parse(text) as WakeComputerResponse;
@@ -538,16 +605,37 @@ export class VersSdkClient {
   /**
    * Put a running computer to sleep while preserving its execution state.
    */
-  async sleepComputer(computer_id: string, body: Record<string, unknown>, params?: SleepComputerParams, options?: RequestOptions): Promise<any> {
-    let url = `/api/v2/computers/${computer_id}/sleep`;
+  async sleepComputer(computer_id: string, params?: SleepComputerParams, options?: RequestOptions): Promise<void>;
+  /** @deprecated The sleep endpoint does not take a request body. Pass SleepComputerParams as the second argument. */
+  async sleepComputer(computer_id: string, body?: Record<string, unknown>, params?: SleepComputerParams, options?: RequestOptions): Promise<void>;
+  async sleepComputer(
+    computer_id: string,
+    paramsOrBody?: SleepComputerParams | Record<string, unknown>,
+    optionsOrParams?: RequestOptions | SleepComputerParams,
+    legacyOptions?: RequestOptions,
+  ): Promise<void> {
+    let params: SleepComputerParams | undefined;
+    let reqOptions: RequestOptions | undefined;
+    if (legacyOptions !== undefined) {
+      params = optionsOrParams as SleepComputerParams | undefined;
+      reqOptions = legacyOptions;
+    } else if (optionsOrParams !== undefined && !isRequestOptions(optionsOrParams) && "skip_wait_boot" in optionsOrParams) {
+      params = optionsOrParams as SleepComputerParams;
+    } else if (paramsOrBody !== undefined && "skip_wait_boot" in paramsOrBody) {
+      params = paramsOrBody as SleepComputerParams;
+      reqOptions = optionsOrParams as RequestOptions | undefined;
+    } else if (optionsOrParams !== undefined && isRequestOptions(optionsOrParams)) {
+      reqOptions = optionsOrParams;
+    } else if (isRequestOptions(paramsOrBody)) {
+      reqOptions = paramsOrBody;
+    }
+
+    let url = `/api/v2/computers/${encodeURIComponent(computer_id)}/sleep`;
     const searchParams = new URLSearchParams();
     if (params?.skip_wait_boot !== undefined) searchParams.append("skip_wait_boot", String(params.skip_wait_boot));
     const qs = searchParams.toString();
     if (qs) url += "?" + qs;
-    const resp = await this.request("POST", url, body, options);
-    const text = await resp.text();
-    if (!text) return {};
-    return JSON.parse(text);
+    await this.request("POST", url, undefined, reqOptions);
   }
 
   /**
@@ -1221,7 +1309,7 @@ export class VersSdkClient {
   /**
    * Validate the presented API key.
    */
-  async validateKey(body: Record<string, unknown>, options?: RequestOptions): Promise<ValidateKeyResponse> {
+  async validateKey(body?: Record<string, unknown>, options?: RequestOptions): Promise<ValidateKeyResponse> {
     let url = "/api/v2/keys/validate";
     const resp = await this.request("POST", url, body, options);
     const text = await resp.text();
@@ -1266,7 +1354,7 @@ export class VersSdkClient {
    * Read a file from a running computer.
    */
   async readComputerFile(computer_id: string, params?: ReadComputerFileParams, options?: RequestOptions): Promise<VmReadFileResponse> {
-    let url = `/api/v2/computers/${computer_id}/files`;
+    let url = `/api/v2/computers/${encodeURIComponent(computer_id)}/files`;
     const searchParams = new URLSearchParams();
     if (params?.path !== undefined) searchParams.append("path", String(params.path));
     const qs = searchParams.toString();
@@ -1279,19 +1367,26 @@ export class VersSdkClient {
 
   /**
    * Write a file into a running computer.
+   *
+   * Pass a `Uint8Array`, `ArrayBuffer`, or UTF-8 `string` with `params.path`
+   * to use the binary `application/octet-stream` contract, or pass a
+   * `VmWriteFileJsonRequest` object to use the JSON/base64 contract.
    */
-  async writeComputerFile(computer_id: string, body: VmWriteFileJsonRequest, params?: WriteComputerFileParams, options?: RequestOptions): Promise<any> {
-    let url = `/api/v2/computers/${computer_id}/files`;
+  async writeComputerFile(
+    computer_id: string,
+    body: Uint8Array | ArrayBuffer | string | VmWriteFileJsonRequest,
+    params?: WriteComputerFileParams,
+    options?: RequestOptions,
+  ): Promise<void> {
+    let url = `/api/v2/computers/${encodeURIComponent(computer_id)}/files`;
     const searchParams = new URLSearchParams();
     if (params?.path !== undefined) searchParams.append("path", String(params.path));
     if (params?.mode !== undefined) searchParams.append("mode", String(params.mode));
     if (params?.create_dirs !== undefined) searchParams.append("create_dirs", String(params.create_dirs));
     const qs = searchParams.toString();
     if (qs) url += "?" + qs;
-    const resp = await this.request("PUT", url, body, options);
-    const text = await resp.text();
-    if (!text) return {};
-    return JSON.parse(text);
+    const payload = typeof body === "string" ? new TextEncoder().encode(body) : body;
+    await this.request("PUT", url, payload, options);
   }
 
   /**

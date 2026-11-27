@@ -132,9 +132,9 @@ export interface RestoreComputerFromCheckpointRequest {
   /** When true, exempt this VM from inactivity auto-sleep. Defaults to false (eligible for auto-sleep). */
   keep_alive?: boolean;
   /** Override individual labels inherited from the checkpoint. A default display name is generated only when neither supplies `name`. This does not rewrite the hostname inside the resumed guest. */
-  labels?: Record<string, string>;
+  labels?: Record<string, string> | null;
   /** Destination project. Required when restoring a project-network checkpoint. */
-  project_id?: string;
+  project_id?: string | null;
   source: CreateComputerSource;
 }
 
@@ -291,7 +291,7 @@ export interface FindTenantOciImageBySourceResponse {
 /** One stable page of the caller's checkpoint catalog, newest first. */
 export interface ListCheckpointsResponse {
   checkpoints: CheckpointResponse[];
-  next_cursor: string;
+  next_cursor: string | null;
 }
 
 export interface ProjectDeletionResult {
@@ -309,7 +309,7 @@ export type CreateComputerSource =
 export namespace CreateComputerSource {
   export interface CheckpointId {
     checkpoint_id: string;
-    type: string;
+    type: "checkpoint";
   }
 
 }
@@ -340,13 +340,13 @@ export interface ProjectMetadata {
 
 /** Durable v2 replay result. An upload identity that is already owned by an import never receives another writable object contract. */
 export type CreateV2OciUploadResponse =
-  | CreateV2OciUploadResponse.UploadId
-  | CreateV2OciUploadResponse.UploadId
-  | CreateV2OciUploadResponse.UploadId
+  | CreateV2OciUploadResponse.UploadReady
+  | CreateV2OciUploadResponse.UploadComplete
+  | CreateV2OciUploadResponse.UploadRetry
 ;
 
 export namespace CreateV2OciUploadResponse {
-  export interface UploadId {
+  export interface UploadReady {
     expires_at: string;
     /** Headers signed into the upload URL. Clients must send every returned header verbatim, including `content-length`. */
     headers: Record<string, unknown>;
@@ -356,12 +356,12 @@ export namespace CreateV2OciUploadResponse {
     url: string;
   }
 
-  export interface UploadId {
+  export interface UploadComplete {
     outcome: string;
     upload_id: string;
   }
 
-  export interface UploadId {
+  export interface UploadRetry {
     outcome: string;
     retry_at: string;
     upload_id: string;
@@ -402,37 +402,34 @@ export interface VmLoadAvg {
 /** Create one or more computers from a computer or checkpoint source. */
 export interface BranchComputersRequest {
   /** Number of computers to create. Defaults to one. */
-  count?: number;
+  count?: number | null;
   /** Create the computers in this project instead of inheriting the source project. */
-  project_id?: string;
+  project_id?: string | null;
   source: BranchSourceRequest;
 }
 
-export type OperationEvent =
-  | OperationEvent.RequestedCursor
-  | OperationEvent.Operation
-  | OperationEvent.Cursor
-;
-
-export namespace OperationEvent {
-  export interface RequestedCursor {
-    available_cursor: number;
-    requested_cursor: number;
-    type: string;
-  }
-
-  export interface Operation {
-    operation: Operation;
-    type: string;
-  }
-
-  export interface Cursor {
-    cursor: number;
-    terminal: boolean;
-    type: string;
-  }
-
+export interface OperationGapEvent {
+  type: "gap";
+  available_cursor: number;
+  requested_cursor: number;
 }
+
+export interface OperationSnapshotEvent {
+  type: "snapshot";
+  operation: Operation;
+}
+
+export interface OperationEndEvent {
+  type: "end";
+  cursor: number;
+  terminal: boolean;
+}
+
+export type OperationEvent =
+  | OperationGapEvent
+  | OperationSnapshotEvent
+  | OperationEndEvent
+;
 
 /** Machine-readable infrastructure failure attached to a terminal exec event. */
 export interface VmExecStreamInfrastructureError {
@@ -501,7 +498,7 @@ export interface CurrentUsageResponse {
   /** API keys represented by this page of VM allocations. */
   api_keys: ApiKeyAllocations[];
   as_of: string;
-  next_cursor: string;
+  next_cursor: string | null;
   /** All non-deleted VMs in the organization, including sleeping VMs. */
   vm_count: number;
 }
@@ -543,7 +540,7 @@ export interface UpdateCheckpointTagRequest {
 /** One stable tenant-computer inventory page. */
 export interface ListComputersResponse {
   computers: ComputerResponse[];
-  next_cursor: string;
+  next_cursor: string | null;
 }
 
 /** Request body for `PATCH /api/v2/computers/{computer_id}/state`. */
@@ -555,32 +552,9 @@ export type AssertedOciImageSourceIdentityKind = "config" | "manifest";
 
 /** Backward-compatible v2 computer creation union. Existing fresh creates retain their flat `vm_config` body; checkpoint restores select an explicit typed source instead. */
 export type CreateComputerRequest =
-  | CreateComputerRequest.VmConfig
-  | CreateComputerRequest.Source
+  | CreateComputerRootRequest
+  | RestoreComputerFromCheckpointRequest
 ;
-
-export namespace CreateComputerRequest {
-  export interface VmConfig {
-    /** When true, exempt this VM from the inactivity auto-sleep. Defaults to false (eligible for auto-sleep). */
-    keep_alive: boolean;
-    /** Project that will own the computer. Restricted keys with multiple grants must choose one; organization-wide keys may omit it. */
-    project_id: string;
-    /** Delete this computer through Chelsea's durable lifecycle worker after the primary platform workload reaches a retained terminal state. */
-    remove_on_workload_exit: boolean;
-    vm_config: VmCreateVmConfig;
-  }
-
-  export interface Source {
-    /** When true, exempt this VM from inactivity auto-sleep. Defaults to false (eligible for auto-sleep). */
-    keep_alive: boolean;
-    /** Override individual labels inherited from the checkpoint. A default display name is generated only when neither supplies `name`. This does not rewrite the hostname inside the resumed guest. */
-    labels: Record<string, string>;
-    /** Destination project. Required when restoring a project-network checkpoint. */
-    project_id: string;
-    source: CreateComputerSource;
-  }
-
-}
 
 /** Tag information within a repository context */
 export interface RepoTagInfo {
@@ -645,7 +619,7 @@ export interface CreateRepoTagRequest {
 /** Computers created by a branch request.  A multi-computer request may create a prefix of the requested batch before encountering an error. In that case the server returns those computers and the error together, using the error's HTTP status. */
 export interface BranchComputersResponse {
   computers: BranchedComputerResponse[];
-  error?: string;
+  error?: string | null;
 }
 
 export interface WhoamiApiKey {
@@ -788,20 +762,20 @@ export interface ListRepositoriesResponse {
 /** Durable status returned by v2 mutation endpoints and operation lookups. */
 export interface Operation {
   /** Server-owned cleanup operation associated with this operation. A create using `remove_on_workload_exit` exposes its future delete here before the workload starts, so cleanup remains observable even after the computer is gone. */
-  cleanup_operation_id?: string;
-  completed_at?: string;
+  cleanup_operation_id?: string | null;
+  completed_at?: string | null;
   created_at: string;
   /** Monotonic durable progress cursor used by the event stream. */
   cursor: number;
-  failure?: unknown;
+  failure?: OperationFailure | null;
   kind: OperationKind;
-  local_result?: unknown;
+  local_result?: OperationResource | null;
   /** Caller-selected idempotency identity, scoped to the authenticated tenant. */
   operation_id: string;
   resource: OperationResource;
-  result?: unknown;
+  result?: OperationResource | null;
   /** Current durable stage. Intermediate stages may be skipped; the stream emits a gap event when that happens. */
-  stage?: string;
+  stage?: string | null;
   status: OperationStatus;
   updated_at: string;
 }
@@ -818,18 +792,18 @@ export interface CreateRepoTagResponse {
 
 /** One frame on the long-lived terminal control request. */
 export type VmTerminalSessionControl =
-  | VmTerminalSessionControl.AttachmentId
-  | VmTerminalSessionControl.AttachmentId
+  | VmTerminalSessionControl.Input
+  | VmTerminalSessionControl.Resize
 ;
 
 export namespace VmTerminalSessionControl {
-  export interface AttachmentId {
+  export interface Input {
     attachment_id: string;
     data_b64: string;
     type: string;
   }
 
-  export interface AttachmentId {
+  export interface Resize {
     attachment_id: string;
     size: VmTerminalSize;
     type: string;
@@ -898,33 +872,33 @@ export namespace BranchSourceRequest {
   export interface ComputerId {
     computer_id: string;
     /** Leave the source computer paused after its checkpoint is captured. */
-    keep_paused: boolean;
+    keep_paused?: boolean;
     /** Fail rather than waiting when the source computer is still booting. */
-    skip_wait_boot: boolean;
-    type: string;
+    skip_wait_boot?: boolean;
+    type: "computer";
   }
 
   export interface CheckpointId {
     checkpoint_id: string;
-    type: string;
+    type: "checkpoint";
   }
 
   export interface TagName {
     tag_name: string;
-    type: string;
+    type: "checkpoint_tag";
   }
 
   export interface Repository {
     repository: string;
     tag_name: string;
-    type: string;
+    type: "repository_tag";
   }
 
   export interface Organization {
     organization: string;
     repository: string;
     tag_name: string;
-    type: string;
+    type: "public_repository_tag";
   }
 
 }
@@ -957,12 +931,12 @@ export interface CheckpointResponse {
   availability: CommitAvailability;
   checkpoint_id: string;
   /** Computer the snapshot was captured from. `null` for snapshots with no recorded source computer. */
-  computer_id: string;
+  computer_id?: string | null;
   created_at: string;
-  description: string;
+  description?: string | null;
   is_public: boolean;
   kind: CheckpointKind;
-  name: string;
+  name?: string | null;
   /** Projects that include this snapshot. */
   project_ids?: string[];
 }
@@ -1010,36 +984,35 @@ export interface CreateComputerRootRequest {
   /** When true, exempt this VM from the inactivity auto-sleep. Defaults to false (eligible for auto-sleep). */
   keep_alive?: boolean;
   /** Project that will own the computer. Restricted keys with multiple grants must choose one; organization-wide keys may omit it. */
-  project_id?: string;
+  project_id?: string | null;
   /** Delete this computer through Chelsea's durable lifecycle worker after the primary platform workload reaches a retained terminal state. */
   remove_on_workload_exit?: boolean;
   vm_config: VmCreateVmConfig;
 }
 
+/** Streaming exec chunk event emitted over the exec stream endpoint (NDJSON). */
+export interface VmExecStreamChunkEvent {
+  type: "chunk";
+  cursor: number;
+  data_b64: string;
+  exec_id?: string | null;
+  stream: VmExecLogStream;
+}
+
+/** Streaming exec terminal exit event emitted over the exec stream endpoint (NDJSON). */
+export interface VmExecStreamExitEvent {
+  type: "exit";
+  cursor: number;
+  exec_id?: string | null;
+  exit_code: number;
+  infrastructure_error?: VmExecStreamInfrastructureError | null;
+}
+
 /** Streaming exec events emitted over the exec stream endpoint (NDJSON lines). */
 export type VmExecStreamEvent =
-  | VmExecStreamEvent.Cursor
-  | VmExecStreamEvent.Cursor
+  | VmExecStreamChunkEvent
+  | VmExecStreamExitEvent
 ;
-
-export namespace VmExecStreamEvent {
-  export interface Cursor {
-    cursor: number;
-    data_b64: string;
-    exec_id: string;
-    stream: VmExecLogStream;
-    type: string;
-  }
-
-  export interface Cursor {
-    cursor: number;
-    exec_id: string;
-    exit_code: number;
-    infrastructure_error: unknown;
-    type: string;
-  }
-
-}
 
 /** Captured primary-workload stream. */
 export type VmWorkloadLogStream = "stdout" | "stderr";
@@ -1053,15 +1026,15 @@ export type CommitAvailability = "local" | "portable" | "unavailable";
 
 /** Snapshot and NDJSON-follow event for primary-workload output. */
 export type VmWorkloadLogEvent =
-  | VmWorkloadLogEvent.LogId
-  | VmWorkloadLogEvent.LogId
-  | VmWorkloadLogEvent.LogId
-  | VmWorkloadLogEvent.LogId
-  | VmWorkloadLogEvent.LogId
+  | VmWorkloadLogEvent.Gap
+  | VmWorkloadLogEvent.Chunk
+  | VmWorkloadLogEvent.CaptureError
+  | VmWorkloadLogEvent.Terminal
+  | VmWorkloadLogEvent.End
 ;
 
 export namespace VmWorkloadLogEvent {
-  export interface LogId {
+  export interface Gap {
     available_cursor: number;
     dropped_bytes: number;
     log_id: string;
@@ -1069,7 +1042,7 @@ export namespace VmWorkloadLogEvent {
     type: string;
   }
 
-  export interface LogId {
+  export interface Chunk {
     cursor: number;
     /** Base64-encoded stdout/stderr bytes. */
     data_b64: string;
@@ -1080,14 +1053,14 @@ export namespace VmWorkloadLogEvent {
     type: string;
   }
 
-  export interface LogId {
+  export interface CaptureError {
     cursor: number;
     error: VmWorkloadLogCaptureError;
     log_id: string;
     type: string;
   }
 
-  export interface LogId {
+  export interface Terminal {
     capture_error: unknown;
     cursor: number;
     log_id: string;
@@ -1095,7 +1068,7 @@ export namespace VmWorkloadLogEvent {
     type: string;
   }
 
-  export interface LogId {
+  export interface End {
     log_id: string;
     message: string;
     next_cursor: number;
